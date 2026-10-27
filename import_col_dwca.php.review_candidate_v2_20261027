@@ -1,0 +1,449 @@
+<?php
+declare(strict_types=1);
+
+/**
+ * Stream-import a Catalogue of Life Darwin Core Archive into Nature Atlas.
+ * Run with PHP CLI only. It never modifies the hand-curated `species` table.
+ * Usage:
+ *   php tools/import_col_dwca.php --archive=/path/to/col-dwca.zip --release="2026-10-16 XR" --doi="10.48580/dgzlf"
+ * or, after extracting the archive:
+ *   php tools/import_col_dwca.php --input-dir=/path/to/extracted-dwca --release="2026-10-16 XR" --doi="10.48580/dgzlf"
+ */
+
+if (PHP_SAPI !== 'cli') {
+    http_response_code(404);
+    exit("Not found\n");
+}
+
+$options = getopt('', [
+    'archive:', 'input-dir:', 'release::', 'doi::', 'dataset::', 'license::',
+    'include-synonyms::', 'batch-size::', 'check-only', 'allow-small-release', 'help'
+]);
+if (isset($options['help']) || (!isset($options['archive']) && !isset($options['input-dir']))) {
+    echo "Nature Atlas global taxonomy importer\n\n";
+    echo "Required: --archive=/path/to/DwC-A.zip OR --input-dir=/path/to/extracted/DwC-A\n";
+    echo "Optional: --release=2026-10-16-XR --doi=10.48580/dgzlf --dataset=COL\n";
+    echo "          --license='See Catalogue of Life release terms' --include-synonyms=1 --batch-size=250\n";
+    echo "          --check-only (validate archive structure and first taxon row without connecting to MySQL)\n";
+    echo "          --allow-small-release (explicitly allow a very small/partial release to replace the current index)\n\n";
+    echo "This imports taxonomy records for Animalia and Plantae. Linked synonyms may also be imported.\n";
+    exit(isset($options['help']) ? 0 : 2);
+}
+
+require_once __DIR__ . '/../config/config.php';
+
+function naCliValue(array $options, string $key, string $default): string {
+    return isset($options[$key]) && is_string($options[$key]) && trim($options[$key]) !== '' ? trim($options[$key]) : $default;
+}
+function naReadAttrs(string $text): array {
+    $attrs = [];
+    if (preg_match_all('/([A-Za-z_:][A-Za-z0-9_.:-]*)\s*=\s*(["\'])(.*?)\2/s', $text, $matches, PREG_SET_ORDER)) {
+        foreach ($matches as $m) $attrs[$m[1]] = html_entity_decode($m[3], ENT_QUOTES | ENT_XML1, 'UTF-8');
+    }
+    return $attrs;
+}
+function naLocalTerm(string $term): string {
+    $term = trim($term);
+    $term = preg_replace('~^.*[/#:]+~', '', $term) ?? $term;
+    return strtolower(preg_replace('/[^A-Za-z0-9]/', '', $term) ?? $term);
+}
+function naDwcChar(string $value, string $default): string {
+    $value = html_entity_decode($value, ENT_QUOTES | ENT_XML1, 'UTF-8');
+    if ($value === '') return $default;
+    $named = ['\\t' => "\t", '\\n' => "\n", '\\r' => "\r", '\\0' => "\0"];
+    return $named[$value] ?? $value;
+}
+function naParseMeta(string $xml): array {
+    if (!preg_match('/<core\b([^>]*)>(.*?)<\/core>/is', $xml, $coreMatch)) {
+        throw new RuntimeException('meta.xml 中没有找到 Taxon core；请下载 Darwin Core Archive（DwC-A）格式。');
+    }
+    $core = naParseSection($coreMatch[1], $coreMatch[2], 'core');
+    $extensions = [];
+    if (preg_match_all('/<extension\b([^>]*)>(.*?)<\/extension>/is', $xml, $matches, PREG_SET_ORDER)) {
+        foreach ($matches as $m) $extensions[] = naParseSection($m[1], $m[2], 'extension');
+    }
+    return ['core' => $core, 'extensions' => $extensions];
+}
+function naParseSection(string $attrsText, string $body, string $kind): array {
+    $attrs = naReadAttrs($attrsText);
+    if (!preg_match('/<location>(.*?)<\/location>/is', $body, $locMatch)) {
+        throw new RuntimeException('meta.xml 中的 ' . $kind . ' 缺少 location。');
+    }
+    $location = trim(html_entity_decode($locMatch[1], ENT_QUOTES | ENT_XML1, 'UTF-8'));
+    if ($location === '' || str_contains($location, '..') || str_starts_with($location, '/') || str_contains($location, '\\')) {
+        throw new RuntimeException('DwC-A 中包含无效文件路径。');
+    }
+    $fields = [];
+    if (preg_match_all('/<field\b([^>]*)\/?\s*>/is', $body, $fieldMatches, PREG_SET_ORDER)) {
+        foreach ($fieldMatches as $f) {
+            $fa = naReadAttrs($f[1]);
+            if (!isset($fa['index'], $fa['term'])) continue;
+            $fields[(int)$fa['index']] = naLocalTerm($fa['term']);
+        }
+    }
+    $coreIdIndex = null;
+    if ($kind === 'core' && preg_match('/<id\b([^>]*)\/?\s*>/is', $body, $idMatch)) {
+        $ia = naReadAttrs($idMatch[1]);
+        if (isset($ia['index'])) $coreIdIndex = (int)$ia['index'];
+    }
+    $coreIdIndexExt = null;
+    if ($kind === 'extension' && preg_match('/<coreid\b([^>]*)\/?\s*>/is', $body, $idMatch)) {
+        $ia = naReadAttrs($idMatch[1]);
+        if (isset($ia['index'])) $coreIdIndexExt = (int)$ia['index'];
+    }
+    return [
+        'location' => $location,
+        'fields' => $fields,
+        'attrs' => $attrs,
+        'core_id_index' => $coreIdIndex,
+        'extension_core_id_index' => $coreIdIndexExt,
+        'row_type' => (string)($attrs['rowType'] ?? ''),
+        'delimiter' => naDwcChar((string)($attrs['fieldsTerminatedBy'] ?? ''), "\t"),
+        'enclosure' => naDwcChar((string)($attrs['fieldsEnclosedBy'] ?? ''), '"'),
+        'ignore_header_lines' => max(0, (int)($attrs['ignoreHeaderLines'] ?? 0)),
+    ];
+}
+function naOpenDataFile(string $path, ?ZipArchive $zip, string $location) {
+    if ($zip instanceof ZipArchive) {
+        $stream = $zip->getStream($location);
+        if (!is_resource($stream)) throw new RuntimeException('无法从压缩档案读取文件：' . $location);
+        return $stream;
+    }
+    $full = realpath(rtrim($path, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $location);
+    $root = realpath($path);
+    if (!$full || !$root || !str_starts_with($full, $root . DIRECTORY_SEPARATOR) || !is_file($full)) {
+        throw new RuntimeException('找不到 DwC-A 数据文件：' . $location);
+    }
+    $fp = fopen($full, 'rb');
+    if (!$fp) throw new RuntimeException('无法打开数据文件：' . $location);
+    return $fp;
+}
+function naHasField(array $fields, string $name): bool {
+    $needle = strtolower($name);
+    foreach ($fields as $fieldName) {
+        if (strtolower((string)$fieldName) === $needle) return true;
+    }
+    return false;
+}
+function naField(array $row, array $fields, string $name): string {
+    $needle = strtolower($name);
+    foreach ($fields as $index => $fieldName) {
+        if (strtolower((string)$fieldName) === $needle) return trim((string)($row[$index] ?? ''));
+    }
+    return '';
+}
+function naTaxonId(array $row, array $core): string {
+    $value = naField($row, $core['fields'], 'taxonID');
+    if ($value !== '') return $value;
+    $index = $core['core_id_index'] ?? null;
+    return $index !== null ? trim((string)($row[$index] ?? '')) : '';
+}
+function naIsRelevantKingdom(string $kingdom): bool {
+    $k = strtolower(trim($kingdom));
+    return in_array($k, ['animalia','plantae'], true);
+}
+function naIsSynonymStatus(string $status, string $acceptedId, string $taxonId): bool {
+    $s = strtolower(trim($status));
+    if ($s === '' && $acceptedId !== '' && $acceptedId !== $taxonId) return true;
+    if (str_contains($s, 'synonym') || str_contains($s, 'misapplied') || str_contains($s, 'invalid') || str_contains($s, 'unaccepted')) return true;
+    return $acceptedId !== '' && $acceptedId !== $taxonId && !in_array($s, ['accepted','accepted name','valid','correct'], true);
+}
+function naIsAcceptedStatus(string $status, string $acceptedId, string $taxonId): bool {
+    if (naIsSynonymStatus($status, $acceptedId, $taxonId)) return false;
+    $s = strtolower(trim($status));
+    return in_array($s, ['', 'accepted', 'accepted name', 'valid', 'correct'], true) || ($acceptedId === '' || $acceptedId === $taxonId);
+}
+function naNormalizeLanguage(string $lang): string {
+    $v = strtolower(trim($lang));
+    if (in_array($v, ['en','eng','english'], true)) return 'en';
+    if (in_array($v, ['zh','zho','chi','cmn','chinese','zh-cn','zh-hans'], true)) return 'zh';
+    if (in_array($v, ['und','unknown',''], true)) return '';
+    return substr($v, 0, 40);
+}
+function naHashKey(string $dataset, string $taxonId, string $release, int $importId): string {
+    // Each run gets a staging namespace, so re-importing the same release cannot overwrite the live index mid-run.
+    return hash('sha256', strtoupper($dataset) . '|' . trim($release) . '|import:' . $importId . '|' . $taxonId);
+}
+function naUtf8Substr(string $value, int $start, int $length): string {
+    if (function_exists('mb_substr')) return mb_substr($value, $start, $length, 'UTF-8');
+    if (function_exists('iconv_substr')) { $result = iconv_substr($value, $start, $length, 'UTF-8'); if ($result !== false) return $result; }
+    $chars = preg_split('//u', $value, -1, PREG_SPLIT_NO_EMPTY);
+    return is_array($chars) ? implode('', array_slice($chars, $start, $length)) : substr($value, $start, $length);
+}
+function naUtf8Lower(string $value): string {
+    if (function_exists('mb_strtolower')) return mb_strtolower($value, 'UTF-8');
+    return strtolower($value);
+}
+function naInsertBatch(PDO $pdo, string $table, array $columns, array $rows, array $updateCols): void {
+    if (!$rows) return;
+    $rowPlaceholders = '(' . implode(',', array_fill(0, count($columns), '?')) . ')';
+    $sql = 'INSERT INTO `' . $table . '` (`' . implode('`,`', $columns) . '`) VALUES ' . implode(',', array_fill(0, count($rows), $rowPlaceholders));
+    if ($updateCols) $sql .= ' ON DUPLICATE KEY UPDATE ' . implode(',', array_map(static fn($c) => '`' . $c . '`=VALUES(`' . $c . '`)', $updateCols));
+    $stmt = $pdo->prepare($sql);
+    $values = [];
+    foreach ($rows as $row) foreach ($columns as $c) $values[] = $row[$c] ?? null;
+    $stmt->execute($values);
+}
+
+$dataset = strtoupper(naCliValue($options, 'dataset', 'COL'));
+$release = naCliValue($options, 'release', 'unspecified-release');
+$doi = naCliValue($options, 'doi', '');
+$licenseNote = naCliValue($options, 'license', 'Catalogue of Life release terms apply; check source-specific rights and exclusions.');
+if (!preg_match('/^[A-Z0-9_-]{1,50}$/', $dataset)) { fwrite(STDERR, "ERROR: --dataset 只能包含英文字母、数字、下划线或连字符，长度不超过 50。\n"); exit(2); }
+if (strlen($release) > 80 || strlen($doi) > 100 || strlen($licenseNote) > 500) { fwrite(STDERR, "ERROR: 发布版本、DOI 或许可说明超过数据库字段长度。\n"); exit(2); }
+$includeSynonyms = !isset($options['include-synonyms']) || !in_array(strtolower((string)$options['include-synonyms']), ['0','false','no'], true);
+$batchSize = (int)naCliValue($options, 'batch-size', '250');
+$batchSize = max(50, min(500, $batchSize));
+$archive = isset($options['archive']) ? (string)$options['archive'] : '';
+$inputDir = isset($options['input-dir']) ? (string)$options['input-dir'] : '';
+$zip = null;
+$sourcePath = '';
+
+try {
+    if ($archive !== '') {
+        $archive = realpath($archive) ?: '';
+        if ($archive === '' || !is_file($archive)) throw new RuntimeException('找不到压缩档案。');
+        if (!class_exists('ZipArchive')) throw new RuntimeException('当前 PHP CLI 没有 ZipArchive。请先用主机文件管理器解压档案，再使用 --input-dir=/path/to/extracted-dwca。');
+        $zip = new ZipArchive();
+        if ($zip->open($archive) !== true) throw new RuntimeException('无法打开 DwC-A ZIP 档案。');
+        $metaIndex = $zip->locateName('meta.xml', ZipArchive::FL_NODIR);
+        if ($metaIndex === false) throw new RuntimeException('压缩档案内没有 meta.xml。');
+        $metaName = $zip->getNameIndex($metaIndex);
+        $stream = $zip->getStream($metaName);
+        if (!is_resource($stream)) throw new RuntimeException('无法读取 meta.xml。');
+        $xml = stream_get_contents($stream); fclose($stream);
+        $sourcePath = $archive;
+    } else {
+        $inputDir = realpath($inputDir) ?: '';
+        if ($inputDir === '' || !is_dir($inputDir)) throw new RuntimeException('找不到已解压的 DwC-A 目录。');
+        $metaPath = $inputDir . DIRECTORY_SEPARATOR . 'meta.xml';
+        if (!is_file($metaPath)) throw new RuntimeException('目录内找不到 meta.xml。请指定已完整解压的 DwC-A 根目录。');
+        $xml = file_get_contents($metaPath);
+        $sourcePath = $inputDir;
+    }
+    if (!is_string($xml) || $xml === '') throw new RuntimeException('meta.xml 是空文件或无法读取。');
+    $meta = naParseMeta($xml);
+    $core = $meta['core'];
+    // In a valid Darwin Core Archive the row identifier may be declared by <id index="…"/>
+    // without a separate field term named taxonID. Treat that core ID index as taxonID.
+    if (!naHasField($core['fields'], 'scientificName') || (!naHasField($core['fields'], 'taxonID') && $core['core_id_index'] === null)) {
+        throw new RuntimeException('Taxon core 必须包含 scientificName，并通过 taxonID 字段或 <id index="…"/> 声明记录 ID。');
+    }
+    if (!naHasField($core['fields'], 'kingdom')) {
+        throw new RuntimeException('Taxon core 缺少 kingdom 字段。请从 Catalogue of Life 下载包含分类字段的 DwC-A。');
+    }
+
+    // Validate every referenced data file and the first core record before any database writes.
+    $coreCheck = naOpenDataFile($sourcePath, $zip, $core['location']);
+    for ($i = 0; $i < $core['ignore_header_lines']; $i++) fgetcsv($coreCheck, 0, $core['delimiter'], $core['enclosure'], '');
+    $sampleRow = fgetcsv($coreCheck, 0, $core['delimiter'], $core['enclosure'], '');
+    fclose($coreCheck);
+    if (!is_array($sampleRow) || naTaxonId($sampleRow, $core) === '' || naField($sampleRow, $core['fields'], 'scientificName') === '') {
+        throw new RuntimeException('Taxon core 的首条数据缺少记录 ID 或 scientificName；请确认下载的是完整且字段结构正确的 DwC-A。');
+    }
+    foreach ($meta['extensions'] as $checkExtension) {
+        $checkFp = naOpenDataFile($sourcePath, $zip, $checkExtension['location']);
+        fclose($checkFp);
+    }
+    if (isset($options['check-only'])) {
+        echo "Archive check passed.\n";
+        echo "Core file: {$core['location']}\n";
+        echo "First taxon ID: " . naTaxonId($sampleRow, $core) . "\n";
+        echo "First scientific name: " . naField($sampleRow, $core['fields'], 'scientificName') . "\n";
+        echo "Extension files checked: " . count($meta['extensions']) . "\n";
+        if ($zip instanceof ZipArchive) $zip->close();
+        exit(0);
+    }
+    fwrite(STDERR, "REVIEW CANDIDATE ONLY: database writes are disabled.\n");
+    exit(3);
+    if (!extension_loaded('pdo_mysql')) throw new RuntimeException('当前 PHP CLI 未安装 pdo_mysql；请在 CLI 对应的 PHP 版本中启用 MySQL PDO 扩展后再导入。');
+    if (!function_exists('mb_substr') && !function_exists('iconv_substr')) throw new RuntimeException('当前 PHP CLI 缺少 mbstring 和 iconv。全量名录导入需要至少一个 UTF-8 字符串扩展，请启用后再运行。');
+    $pdo = new PDO('mysql:host=' . DB_HOST . ';port=' . DB_PORT . ';dbname=' . DB_NAME . ';charset=utf8mb4', DB_USER, DB_PASS, [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        PDO::ATTR_EMULATE_PREPARES => false,
+    ]);
+    $lockName = 'na_global_taxonomy_' . substr(hash('sha256', $dataset), 0, 32);
+    $lockStmt = $pdo->prepare('SELECT GET_LOCK(?, 0)');
+    $lockStmt->execute([$lockName]);
+    $lockAcquired = (int)$lockStmt->fetchColumn() === 1;
+    if (!$lockAcquired) throw new RuntimeException('该数据集已有导入任务正在运行。请等待任务结束后再试。');
+
+    $importStmt = $pdo->prepare('INSERT INTO global_taxa_imports (source_dataset,source_release,source_doi,license_note,status,started_at) VALUES (?,?,?,?,\'running\',NOW())');
+    $importStmt->execute([$dataset,$release,$doi,$licenseNote]);
+    $importId = (int)$pdo->lastInsertId();
+    echo "Import #{$importId}: {$dataset} {$release}\n";
+    echo "Reading taxon core: {$core['location']}\n";
+
+    $taxonColumns = ['record_key','source_dataset','source_release','source_taxon_id','parent_taxon_id','accepted_taxon_id','scientific_name','canonical_name','authorship','taxon_rank','taxonomic_status','kingdom','phylum','class_name','order_name','family_name','genus','is_accepted','is_species','source_doi','source_url','is_current','last_seen_import_id'];
+    $taxonUpdate = ['source_release','parent_taxon_id','accepted_taxon_id','scientific_name','canonical_name','authorship','taxon_rank','taxonomic_status','kingdom','phylum','class_name','order_name','family_name','genus','is_accepted','is_species','source_doi','source_url','last_seen_import_id','updated_at'];
+    $taxonBatch = [];
+    $processed = $acceptedRows = $synonymRows = $skipped = 0;
+    $fp = naOpenDataFile($sourcePath, $zip, $core['location']);
+    for ($i = 0; $i < $core['ignore_header_lines']; $i++) fgetcsv($fp, 0, $core['delimiter'], $core['enclosure'], '');
+    while (($row = fgetcsv($fp, 0, $core['delimiter'], $core['enclosure'], '')) !== false) {
+        $processed++;
+        $taxonId = naTaxonId($row, $core);
+        $scientificName = naField($row, $core['fields'], 'scientificName');
+        $kingdom = naField($row, $core['fields'], 'kingdom');
+        $acceptedId = naField($row, $core['fields'], 'acceptedNameUsageID');
+        $status = naField($row, $core['fields'], 'taxonomicStatus');
+        if ($taxonId === '' || $scientificName === '') { $skipped++; continue; }
+        $isRelevant = naIsRelevantKingdom($kingdom);
+        $isSynonym = naIsSynonymStatus($status, $acceptedId, $taxonId);
+        // Only keep records explicitly assigned to Animalia or Plantae. This prevents
+        // unrelated linked synonyms from other kingdoms entering the animal/plant index.
+        if (!$isRelevant) { $skipped++; continue; }
+        if ($isSynonym && !$includeSynonyms) { $skipped++; continue; }
+        $accepted = naIsAcceptedStatus($status, $acceptedId, $taxonId) ? 1 : 0;
+        $rank = strtolower(naField($row, $core['fields'], 'taxonRank'));
+        $canonical = naField($row, $core['fields'], 'canonicalName');
+        if ($canonical === '') $canonical = $scientificName;
+        $sourceUrl = filter_var($taxonId, FILTER_VALIDATE_URL) ? $taxonId : ('https://www.catalogueoflife.org/data/taxon/' . rawurlencode($taxonId));
+        $taxonBatch[] = [
+            'record_key'=>naHashKey($dataset,$taxonId,$release,$importId),'source_dataset'=>$dataset,'source_release'=>$release,'source_taxon_id'=>$taxonId,
+            'parent_taxon_id'=>naField($row,$core['fields'],'parentNameUsageID'),'accepted_taxon_id'=>$acceptedId,
+            'scientific_name'=>naUtf8Substr($scientificName,0,500),'canonical_name'=>naUtf8Substr($canonical,0,400),
+            'authorship'=>naUtf8Substr(naField($row,$core['fields'],'scientificNameAuthorship'),0,255),
+            'taxon_rank'=>naUtf8Substr($rank,0,80),'taxonomic_status'=>naUtf8Substr($status,0,80),
+            'kingdom'=>naUtf8Substr($kingdom,0,80),'phylum'=>naUtf8Substr(naField($row,$core['fields'],'phylum'),0,120),
+            'class_name'=>naUtf8Substr(naField($row,$core['fields'],'class'),0,120),'order_name'=>naUtf8Substr(naField($row,$core['fields'],'order'),0,120),
+            'family_name'=>naUtf8Substr(naField($row,$core['fields'],'family'),0,160),'genus'=>naUtf8Substr(naField($row,$core['fields'],'genus'),0,160),
+            'is_accepted'=>$accepted,'is_species'=>($rank === 'species' ? 1 : 0),'source_doi'=>$doi,'source_url'=>$sourceUrl ?: null,
+            'is_current'=>0,'last_seen_import_id'=>$importId,
+        ];
+        if ($accepted) $acceptedRows++; else $synonymRows++;
+        if (count($taxonBatch) >= $batchSize) {
+            naInsertBatch($pdo,'global_taxa',$taxonColumns,$taxonBatch,$taxonUpdate); $taxonBatch=[];
+            if (($processed % 10000) < $batchSize) echo "Taxon rows scanned: {$processed}; selected: " . ($acceptedRows+$synonymRows) . "\n";
+        }
+    }
+    if ($taxonBatch) naInsertBatch($pdo,'global_taxa',$taxonColumns,$taxonBatch,$taxonUpdate);
+    fclose($fp);
+    echo "Taxon core finished; accepted={$acceptedRows}, linked/non-accepted={$synonymRows}, skipped={$skipped}.\n";
+
+    $vernacularRows = 0;
+    $vernacularColumns = ['name_hash','record_key','source_dataset','source_taxon_id','language_code','name_value','name_type','source_release','is_current','last_seen_import_id'];
+    $vernacularUpdate = ['language_code','name_value','name_type','source_release','last_seen_import_id','updated_at'];
+    foreach ($meta['extensions'] as $ext) {
+        $rowType = strtolower($ext['row_type']);
+        $fieldMap = $ext['fields'];
+        if (!str_contains($rowType, 'vernacularname') && !naHasField($fieldMap, 'vernacularName')) continue;
+        $coreIdIndex = $ext['extension_core_id_index'];
+        if ($coreIdIndex === null || !naHasField($fieldMap, 'vernacularName')) continue;
+        echo "Reading vernacular names: {$ext['location']}\n";
+        $extFp = naOpenDataFile($sourcePath,$zip,$ext['location']);
+        for ($i=0;$i<$ext['ignore_header_lines'];$i++) fgetcsv($extFp,0,$ext['delimiter'],$ext['enclosure'],'');
+        $nameBatch=[];
+        while (($row=fgetcsv($extFp,0,$ext['delimiter'],$ext['enclosure'],'')) !== false) {
+            $taxonId=trim((string)($row[$coreIdIndex] ?? ''));
+            $nameValue=naField($row,$fieldMap,'vernacularName');
+            if ($taxonId==='' || $nameValue==='') continue;
+            $lang=naNormalizeLanguage(naField($row,$fieldMap,'language'));
+            $recordKey=naHashKey($dataset,$taxonId,$release,$importId);
+            $nameHash=hash('sha256',$recordKey.'|'.$lang.'|'.naUtf8Lower($nameValue));
+            $nameBatch[]=[
+                'name_hash'=>$nameHash,'record_key'=>$recordKey,'source_dataset'=>$dataset,'source_taxon_id'=>$taxonId,
+                'language_code'=>$lang,'name_value'=>naUtf8Substr($nameValue,0,500),'name_type'=>'vernacular',
+                'source_release'=>$release,'is_current'=>0,'last_seen_import_id'=>$importId,
+            ];
+            $vernacularRows++;
+            if(count($nameBatch)>=$batchSize){naInsertBatch($pdo,'global_taxon_names',$vernacularColumns,$nameBatch,$vernacularUpdate);$nameBatch=[];}
+        }
+        if($nameBatch) naInsertBatch($pdo,'global_taxon_names',$vernacularColumns,$nameBatch,$vernacularUpdate);
+        fclose($extFp);
+        break;
+    }
+
+    // Refuse to publish a likely partial download by default. An explicit override is
+    // available for testing or intentionally small source releases.
+    $selectedTaxa = $acceptedRows + $synonymRows;
+    $previousCountStmt = $pdo->prepare('SELECT COUNT(*) FROM global_taxa WHERE source_dataset=? AND is_current=1');
+    $previousCountStmt->execute([$dataset]);
+    $previousCount = (int)$previousCountStmt->fetchColumn();
+    if (!isset($options['allow-small-release']) && $selectedTaxa < 1000) {
+        throw new RuntimeException('本次只解析到 ' . $selectedTaxa . ' 条动物/植物分类记录，低于默认最小阈值 1000；为避免把不完整文件发布为当前名录，已中止。确实要导入小型测试数据时，可显式加 --allow-small-release。');
+    }
+    if (!isset($options['allow-small-release']) && $includeSynonyms && $previousCount >= 10000 && $selectedTaxa < (int)floor($previousCount * 0.5)) {
+        throw new RuntimeException('本次分类记录数不足当前名录的 50%，可能是下载或解析不完整；旧名录保持当前状态。确认源数据确实应大幅缩小时，才使用 --allow-small-release 覆盖。');
+    }
+
+    // Publish atomically only after the core and name extension have completed.
+    // The transaction flips the current version. Large old-release cleanup runs only
+    // after commit in small batches, so a cleanup timeout cannot roll back publication
+    // and does not create one enormous DELETE transaction on shared hosting.
+    $pdo->beginTransaction();
+    $stmt=$pdo->prepare("UPDATE global_taxa SET is_current=0 WHERE source_dataset=? AND is_current=1 AND (last_seen_import_id IS NULL OR last_seen_import_id<>?)");
+    $stmt->execute([$dataset,$importId]);
+    $stmt=$pdo->prepare("UPDATE global_taxa SET is_current=1 WHERE source_dataset=? AND last_seen_import_id=?");
+    $stmt->execute([$dataset,$importId]);
+    $stmt=$pdo->prepare("UPDATE global_taxon_names SET is_current=0 WHERE source_dataset=? AND is_current=1 AND (last_seen_import_id IS NULL OR last_seen_import_id<>?)");
+    $stmt->execute([$dataset,$importId]);
+    $stmt=$pdo->prepare("UPDATE global_taxon_names SET is_current=1 WHERE source_dataset=? AND last_seen_import_id=?");
+    $stmt->execute([$dataset,$importId]);
+    $finish=$pdo->prepare("UPDATE global_taxa_imports SET status='completed',total_taxon_rows=?,accepted_rows=?,synonym_rows=?,skipped_rows=?,vernacular_rows=?,finished_at=NOW(),message=? WHERE id=?");
+    $finish->execute([$processed,$acceptedRows,$synonymRows,$skipped,$vernacularRows,'Current release published. Old detail-row cleanup runs in batches; this import does not create editorial species descriptions.',$importId]);
+    $pdo->commit();
+
+    // The full taxonomy may have millions of rows. Remove superseded detail in batches
+    // to avoid multiplying DB storage with each monthly import. If cleanup fails, keep
+    // the new release published; the next run can finish pruning inactive rows.
+    $cleanupWarning = '';
+    $deletedNames = 0;
+    $deletedTaxa = 0;
+    try {
+        $cleanupNames = $pdo->prepare('DELETE FROM global_taxon_names WHERE source_dataset=? AND (last_seen_import_id IS NULL OR last_seen_import_id<>?) ORDER BY id LIMIT 5000');
+        do {
+            $cleanupNames->execute([$dataset,$importId]);
+            $removed = $cleanupNames->rowCount();
+            $deletedNames += $removed;
+        } while ($removed === 5000);
+        $cleanupTaxa = $pdo->prepare('DELETE FROM global_taxa WHERE source_dataset=? AND (last_seen_import_id IS NULL OR last_seen_import_id<>?) ORDER BY id LIMIT 5000');
+        do {
+            $cleanupTaxa->execute([$dataset,$importId]);
+            $removed = $cleanupTaxa->rowCount();
+            $deletedTaxa += $removed;
+        } while ($removed === 5000);
+        $msg = 'Completed. Older detail rows pruned (taxa=' . $deletedTaxa . ', vernacular_names=' . $deletedNames . '). Import history metadata retained. Source archive must be cited; no editorial species descriptions were created.';
+        $finishMessage = $pdo->prepare('UPDATE global_taxa_imports SET message=? WHERE id=?');
+        $finishMessage->execute([$msg,$importId]);
+    } catch (Throwable $cleanupError) {
+        $cleanupWarning = ' Previous inactive rows may remain; the new release is already published. Run the importer again during a maintenance window to finish cleanup.';
+        error_log('Nature Atlas catalogue cleanup for import #' . $importId . ' failed: ' . $cleanupError->getMessage());
+        try {
+            $finishMessage = $pdo->prepare('UPDATE global_taxa_imports SET message=? WHERE id=?');
+            $finishMessage->execute(['Published current release successfully, but old-row cleanup was incomplete. The current index remains available; rerun the importer to finish pruning.',$importId]);
+        } catch (Throwable $messageError) { error_log('Could not update catalogue cleanup warning: ' . $messageError->getMessage()); }
+    }
+    if (!empty($lockAcquired) && isset($lockName)) {
+        try { $releaseLock=$pdo->prepare('SELECT RELEASE_LOCK(?)'); $releaseLock->execute([$lockName]); }
+        catch (Throwable $releaseError) { error_log('Nature Atlas could not explicitly release catalogue import lock: ' . $releaseError->getMessage()); }
+        $lockAcquired=false;
+    }
+    echo "\nCompleted import #{$importId}. Taxon core rows scanned={$processed}; accepted={$acceptedRows}; linked/non-accepted={$synonymRows}; skipped={$skipped}; vernacular names={$vernacularRows}.\n";
+    echo "Global catalogue switched to current imported release for dataset {$dataset}. Removed old records: taxa={$deletedTaxa}, vernacular_names={$deletedNames}.{$cleanupWarning}\n";
+    if ($zip instanceof ZipArchive) $zip->close();
+    exit(0);
+} catch (Throwable $e) {
+    if (isset($pdo) && $pdo instanceof PDO) {
+        try { if ($pdo->inTransaction()) $pdo->rollBack(); } catch (Throwable $ignored) {}
+        if (isset($importId)) {
+            try {
+                // Failed import rows were staged under a unique import id and were never published.
+                $pdo->beginTransaction();
+                $cleanNames=$pdo->prepare('DELETE FROM global_taxon_names WHERE last_seen_import_id=? AND is_current=0');
+                $cleanNames->execute([$importId]);
+                $cleanTaxa=$pdo->prepare('DELETE FROM global_taxa WHERE last_seen_import_id=? AND is_current=0');
+                $cleanTaxa->execute([$importId]);
+                $failed=$pdo->prepare("UPDATE global_taxa_imports SET status='failed',finished_at=NOW(),message=? WHERE id=?");
+                $message = function_exists('mb_substr') ? mb_substr($e->getMessage(),0,4000,'UTF-8') : (function_exists('iconv_substr') ? (iconv_substr($e->getMessage(),0,4000,'UTF-8') ?: substr($e->getMessage(),0,4000)) : substr($e->getMessage(),0,4000));
+                $failed->execute([$message,$importId]);
+                $pdo->commit();
+            } catch (Throwable $ignored) { try { if ($pdo->inTransaction()) $pdo->rollBack(); } catch (Throwable $ignoredAgain) {} }
+        }
+        if (!empty($lockAcquired) && isset($lockName)) { try { $releaseLock=$pdo->prepare('SELECT RELEASE_LOCK(?)'); $releaseLock->execute([$lockName]); } catch (Throwable $ignored) {} }
+    }
+    if ($zip instanceof ZipArchive) $zip->close();
+    fwrite(STDERR, "ERROR: " . $e->getMessage() . "\n");
+    exit(1);
+}
